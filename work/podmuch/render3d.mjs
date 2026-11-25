@@ -292,10 +292,10 @@ function snowTexture(style,bump) {
     const grit=(random/4294967296-.5)*(packed?5:bump?17:12);
     const drifts=Math.sin(3*u+2*v)*Math.cos(2*u-3*v);
     const grains=Math.sin(17*u-13*v)*Math.cos(11*u+21*v);
-    const groove=(.5+.5*Math.cos(42*u+.12*Math.sin(2*v)))**3;
+    const groove=(.5+.5*Math.cos(32*u+.08*Math.sin(2*v)))**2;
     const packedLines=(.5+.5*Math.cos(56*u+.7*Math.cos(v)))**5;
-    const relief=groomed?groove*25+grains*2:packed?packedLines*9:drifts*26+grains*10;
-    const tint=groomed?244-groove*11+drifts*2:packed?242-packedLines*5:235+drifts*7+grains*4;
+    const relief=groomed?groove*42+grains*2:packed?packedLines*9:drifts*26+grains*10;
+    const tint=groomed?247-groove*16+drifts*2:packed?242-packedLines*5:235+drifts*7+grains*4;
     const luminance=bump?126+grit+relief:tint+grit;
     const i=(y*size+x)*4;
     data.set([luminance-(bump?0:packed?3:2),luminance,Math.min(255,luminance+(bump?0:3)),255],i);
@@ -314,7 +314,7 @@ function materialSet() {
   const shared={vertexColors:true,side:DoubleSide,roughness:.78};
   const snowMaterials=snowStyles.map((style,i)=>new MeshStandardMaterial({
     ...shared,map:snowTexture(style,false),bumpMap:snowTexture(style,true),
-    roughness:[.94,.87,.58][i],bumpScale:[.125,.10,.042][i],envMapIntensity:i===2?.39:.21
+    roughness:[.94,.74,.58][i],bumpScale:[.125,.16,.042][i],envMapIntensity:i===2?.39:i===1?.32:.21
   }));
   return [
     new MeshStandardMaterial({...shared,envMapIntensity:.43}),
