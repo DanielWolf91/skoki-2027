@@ -1,0 +1,10 @@
+{
+  "name": "skoki-2027",
+  "private": true,
+  "scripts": {
+    "setup": "npm ci --prefix work/podmuch",
+    "build": "node build.cjs",
+    "test": "node work/verify-podmuch.cjs && node work/verify-skoki-competition.cjs && node work/podmuch/verify-athlete.mjs && node work/verify-skoki-cloud.mjs"
+  },
+  "engines": {"node": ">=24"}
+}
