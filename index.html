@@ -5589,6 +5589,42 @@ function xAtDistance(d) {
 const down = new Set();
 const touchHeld=new Map();
 const step=1/120;
+// Reference speeds in km/h. Fictional and custom hills interpolate by HS.
+const inrunSpeedPoints=[[45,54],[70,69],[82,75],[100,83],[107,85.5],[125,88],[140,90],[147,92],[185,97],[240,103],[250,105]];
+const venueInrunSpeeds={lillehammer:89.2,zakopane:90,planica:104,vikersund:100};
+let inrunDrive=1,inrunSpeed=25,flightSpeedScale=1;
+function referenceInrunSpeed(hill) {
+  if(Object.hasOwn(venueInrunSpeeds,hill.id)) return venueInrunSpeeds[hill.id]/3.6;
+  const index=inrunSpeedPoints.findIndex(([hs])=>hs>=hill.hs);
+  if(index<=0) return inrunSpeedPoints[index===0?0:inrunSpeedPoints.length-1][1]/3.6;
+  const [a,va]=inrunSpeedPoints[index-1],[b,vb]=inrunSpeedPoints[index];
+  return mix(va,vb,(hill.hs-a)/(b-a))/3.6;
+}
+function inrunAcceleration(gradient,speedSquared,drive) {
+  return -9.81*gradient/Math.hypot(1,gradient)*drive-.12-(.0025/hillScale)*speedSquared;
+}
+function calibrateInrun(target) {
+  const dx=-initialX/240;
+  const profile=Array.from({length:240},(_,i)=>{
+    const gradient=slope(ramp,initialX+(i+.5)*dx);
+    return [gradient,2*dx*Math.hypot(1,gradient)];
+  });
+  const finishSpeedSquared=drive=>{
+    let speedSquared=0;
+    for(const [gradient,delta] of profile) {
+      speedSquared=Math.max(0,speedSquared+delta*inrunAcceleration(gradient,speedSquared,drive));
+    }
+    return speedSquared;
+  };
+  let low=.35,high=2.7;
+  for(let i=0;i<16;i++) {
+    const drive=(low+high)*.5;
+    if(finishSpeedSquared(drive)<target*target) low=drive;
+    else high=drive;
+  }
+  flightSpeedScale=target/Math.sqrt(finishSpeedSquared(1));
+  return (low+high)*.5;
+}
 let s;
 let best=0;
 let recording=null,replay=null,afterJump=null,cpuShow=null,ceremony=null;
@@ -5916,7 +5952,7 @@ function landingQuality(lead) {
   return smooth(.045,.17,lead)*(1-smooth(.40,.56,lead));
 }
 function addTakeoffImpulse(delta) {
-  const impulse=delta*Math.sqrt(hillScale);
+  const impulse=delta*Math.sqrt(hillScale)*flightSpeedScale;
   // The skis push away from the sloping table along its normal.
   s.vx-=impulse*Math.sin(s.takeoffAngle);
   s.vy+=impulse*Math.cos(s.takeoffAngle);
@@ -5930,12 +5966,13 @@ function simulate(stepSize) {
     if(s.waited>=startWindow-1e-9) setPhase('inrun');
     return;
   }
-  s.previous={x:s.x,y:s.y,z:s.z,yaw:s.yaw,tick:s.tick,pitch:s.pitch,armFold:s.armFold||0};
+  s.previous={x:s.x,y:s.y,z:s.z,yaw:s.yaw,tick:s.tick,pitch:s.pitch,armFold:s.armFold||0,
+    vx:s.vx,vy:s.vy,wind:s.wind,windSide:s.windSide};
   s.tick+=dt;
   simWind(s.tick+(s.waited||0));
   if(s.state==='inrun') {
     const gradient=slope(ramp,s.x);
-    s.v+=(-9.81*gradient/Math.hypot(1,gradient)-.12-(.0025/hillScale)*s.v*s.v)*dt;
+    s.v+=inrunAcceleration(gradient,s.v*s.v,inrunDrive)*dt;
     const nextX=s.x+s.v/Math.hypot(1,gradient)*dt;
     s.x=Math.min(0,nextX);
     s.y=ramp(s.x);
@@ -5988,7 +6025,10 @@ function simulate(stepSize) {
     const setting=Math.exp(-1.2*postureLoss);
     const ax=s.vx+s.wind+gust, ay=s.vy;
     const airspeed=Math.hypot(ax,ay,s.vz-s.windSide);
-    const lift=(.00555+.0019*(1-Math.exp(-age*.53/Math.sqrt(hillScale))))/hillScale*airspeed**2*(.32+.68*setting);
+    // Retune lift for the calibrated gate speed so scaled hills keep a usable landing zone.
+    const liftCorrection=.44*9.81*(1-flightSpeedScale**2)*(s.vx*s.vx+s.vy*s.vy)/(inrunSpeed*.966)**2;
+    const lift=((.00555+.0019*(1-Math.exp(-age*.53/Math.sqrt(hillScale))))/hillScale*airspeed**2+
+      liftCorrection)*(.32+.68*setting);
     const drag=.00125/hillScale*airspeed**2*(1+Math.min(2,postureLoss));
     s.vx+=(-drag*ax-lift*ay)/airspeed*dt;
     s.vy+=(-9.81+(lift*ax-drag*ay)/airspeed)*dt;
@@ -6131,7 +6171,8 @@ function exitSequence(actor,leader) {
   }
   let length=0;
   const ends=path.slice(1).map((point,i)=>length+=Math.hypot(point[0]-path[i][0],point[2]-path[i][2]));
-  return {time:0,length,path,ends,leader,gateZ:z+.26,gateDistance:ends[1],duration:2.45+length/exitWalkingSpeed+1.12};
+  return {time:0,length,path,ends,leader,gateZ:z+.26,gateDistance:ends[1],
+    duration:2.45+length/exitWalkingSpeed+1.12,footprints:[],nextFootstep:0};
 }
 function exitPosition(sequence,distance) {
   const at=clamp(distance,0,sequence.length);
@@ -6140,16 +6181,21 @@ function exitPosition(sequence,distance) {
   const ratio=(at-begin)/(sequence.ends[i]-begin||1);
   return from.map((value,axis)=>mix(value,to[axis],ratio));
 }
-function exitActor(actor,sequence) {
-  const time=sequence.time,walking=Math.max(0,time-2.45);
-  const travel=exitWalkingSpeed*(walking-.23*(1-Math.exp(-walking/.23)));
-  const shorterStep=.27*exitWalkingSpeed*smooth(sequence.gateDistance-1.2,sequence.gateDistance+.55,travel);
-  const distance=clamp(travel-shorterStep,0,sequence.length);
+const walkCycleDistance=1.45;
+function exitStepPosition(sequence,distance) {
   const centre=exitPosition(sequence,distance);
   const trail=exitPosition(sequence,distance-.39),ahead=exitPosition(sequence,distance+.45);
   const corner=.72*smooth(.10,.78,distance)*(1-smooth(sequence.length-.88,sequence.length,distance));
   for(const i of [0,2]) centre[i]=mix(centre[i],(trail[i]+ahead[i])*.5,corner);
   const heading=Math.atan2(ahead[2]-trail[2],ahead[0]-trail[0]);
+  return {centre,heading,trail};
+}
+function exitActor(actor,sequence) {
+  const time=sequence.time,walking=Math.max(0,time-2.45);
+  const travel=exitWalkingSpeed*(walking-.23*(1-Math.exp(-walking/.23)));
+  const shorterStep=.27*exitWalkingSpeed*smooth(sequence.gateDistance-1.2,sequence.gateDistance+.55,travel);
+  const distance=clamp(travel-shorterStep,0,sequence.length);
+  const {centre,heading,trail}=exitStepPosition(sequence,distance);
   const lookAhead=exitPosition(sequence,distance+1.45);
   const nextHeading=Math.atan2(lookAhead[2]-trail[2],lookAhead[0]-trail[0]);
   const lookTurn=clamp(Math.sin(nextHeading-heading)*.64,-.38,.38);
@@ -6162,6 +6208,24 @@ function exitActor(actor,sequence) {
   return {...actor,x:centre[0],y:centre[1],z:centre[2],yaw:yaw+Math.atan2(Math.sin(endHeading-yaw),Math.cos(endHeading-yaw))*stopTurn,
     tick:actor.tick+time,exitAge:time,gait:distance,gateCarry,lookTurn,gaitAmount:smooth(0,.7,distance)*(1-smooth(sequence.length-.92,sequence.length,distance)),
     onPodium:sequence.leader&&last,hidden:!sequence.leader&&time>=sequence.duration};
+}
+function updateFootprints(actor,sequence) {
+  if(actor.exitAge<2.45) return;
+  const limit=sequence.leader?sequence.ends.at(-3):sequence.length;
+  while(true) {
+    const step=sequence.nextFootstep;
+    const distance=(step+1)*walkCycleDistance*.5;
+    if(distance>actor.gait||distance>=limit) break;
+    const side=step%2?1:-1;
+    const {centre,heading}=exitStepPosition(sequence,distance);
+    const angle=heading+side*.09,cos=Math.cos(angle),sin=Math.sin(angle);
+    const x=centre[0]+cos*.15-Math.sin(heading)*side*.17;
+    const z=centre[2]+sin*.15+Math.cos(heading)*side*.17;
+    const marker=(forward,lateral)=>[x+cos*forward-sin*lateral,centre[1]+.039,z+sin*forward+cos*lateral];
+    face([marker(.15,.040),marker(.18,0),marker(.15,-.040),marker(-.13,-.044),
+      marker(-.17,-.020),marker(-.17,.020),marker(-.13,.044)],'#a4baca',sequence.footprints);
+    sequence.nextFootstep++;
+  }
 }
 const rivalNames=[
   ['AUT',['Markus Auer','Daniel Leitner','Lukas Moser','Florian Egger','Sebastian Pichler','David Koller','Martin Hofer']],
@@ -6570,9 +6634,12 @@ function continueOrderedRound(stamp=null) {
   for(const id of ['intro','result','hud','touch']) $(id).hidden=true;
   $('cpu-panel').hidden=false;
   const end=xAtDistance(row.distance);
-  const flight=clamp(end/(24.6+Math.max(0,activeHill.hs-140)*.065),2.15,8.4);
-  const approach=1.64*(-initialX)/(end/flight);
-  cpuShow={row,index,time:0,end,approach,flight,duration:approach+flight+2.35,
+  const angle=Math.atan(slope(ramp,0));
+  const takeoffSpeed=inrunSpeed+(competitionRandom(row.bib,'speed')()-.5)*.36;
+  const horizontalSpeed=takeoffSpeed*Math.cos(angle);
+  const flight=clamp(end/horizontalSpeed,1,9.3);
+  const approach=1.64*(-initialX)/horizontalSpeed;
+  cpuShow={row,index,time:0,end,approach,flight,takeoffSpeed,angle,duration:approach+flight+2.35,
     windTarget:leadTargetReference(row.bib),appearance:competitionAppearance(row)};
   $('cpu-name').textContent=`${eventRoundName()} · Nr ${row.startNumber} · ${row.name} · ${row.country}`;
   $('cpu-score').textContent=`${index+1} / ${competition.order.length}`;
@@ -6599,7 +6666,7 @@ function skipCpuJump(toPlayer=false) {
   continueOrderedRound();
 }
 function cpuActor() {
-  const {row,time,end,approach,flight,appearance}=cpuShow;
+  const {row,time,end,approach,flight,appearance,takeoffSpeed,angle}=cpuShow;
   const launchSpeed=end/flight,base={tick:time,z:0,yaw:0,wind:row.wind,windSide:0,pitch:idealFlightPitch,vz:0,
     appearance,landingTime:null,windTarget:cpuShow.windTarget,flightWind:row.wind*clamp(time-approach,0,flight)};
   if(time<approach) {
@@ -6613,13 +6680,13 @@ function cpuActor() {
       (6.6+end*.018)*Math.sin(Math.PI*t)**1.18;
     const vy=(fly(Math.min(1,u+.001))-fly(Math.max(0,u-.001)))/(.002*flight);
     return {...base,state:'flight',x,y:fly(u),vx:launchSpeed,vy,v:launchSpeed,
-      takeoffSpeed:launchSpeed,takeoffTime:approach,takeoffAngle:Math.atan(slope(ramp,0)),flightStart:approach,
+      takeoffSpeed,takeoffTime:approach,takeoffAngle:angle,flightStart:approach,
       landingTime:time>=approach+flight-.32?approach+flight-.32:null,landCountdown:(1-u)*flight};
   }
   const age=time-approach-flight,brake=1-Math.exp(-age*1.5);
   const x=Math.min(runoutEnd-2.3,end+launchSpeed*brake/1.5);
   return {...base,state:'outrun',x,y:terrain(x),vx:launchSpeed*(1-brake),vy:0,v:launchSpeed*(1-brake),
-    takeoffSpeed:launchSpeed,outStart:approach+flight,touchdownX:end,touchdownZ:0,touchdownPose:poses.approach,
+    takeoffSpeed,outStart:approach+flight,touchdownX:end,touchdownZ:0,touchdownPose:poses.approach,
     landing:row.fall?'Upadek':'Telemark',brake};
 }
 function openPodium() {
@@ -7753,6 +7820,8 @@ function prepareHill(hill) {
   hillHeight=hillScale*(1+clamp((hill.k/hill.hs-125/140)*.16,-.025,.025));
   hillWidth=Math.sqrt(hillScale);
   initialX=baseStart*hillScale;
+  inrunSpeed=referenceInrunSpeed(hill);
+  inrunDrive=calibrateInrun(inrunSpeed);
   runoutEnd=baseRunoutEnd*hillScale;
   buildDistances();
   const warp=([x,y,z])=>[x*hillScale,y*hillHeight,crossWidth(z)];
@@ -8111,17 +8180,19 @@ function glidePose(pitch,age,gust) {
   // knees retain a slight bend, and the arms trail along the sides of the suit.
   const knee=segment(binding,.34,radians(7)+lean*.30,.255);
   const hip=segment(knee,.37,radians(15)+lean*.43);
-  const torso=radians(14)+lean*.57+radians(gust*.65);
+  const settle=smooth(.22,.65,age);
+  const breath=settle*(.38*Math.sin(age*2.25)+.15*Math.sin(age*3.17+.7));
+  const torso=radians(14+breath+gust*.35)+lean*.57;
   const shoulder=segment(hip,.50,torso);
-  const head=segment(shoulder,.208,torso-radians(8+Math.sin(age*4.6)*1.2),.010*Math.sin(age*2.7));
+  const head=segment(shoulder,.208,torso-radians(8+breath*.59),.006*settle*Math.sin(age*2.7));
   const elbow=segment(shoulder,-.285,torso+radians(6),.218);
-  const hand=segment(elbow,-.257,torso+radians(5+gust*.85),.211+.008*Math.sin(age*6.2));
+  const hand=segment(elbow,-.257,torso+radians(5+gust*.35+breath*.8),.211+.005*settle*Math.sin(age*3.3));
   const spread=radians(mix(11.5,14.6,smooth(.44,1.12,age)));
-  return {hip,shoulder,head,knee,elbow,hand,spread,stride:0,roll:radians(.88*Math.sin(age*3.1)+gust*.40)};
+  return {hip,shoulder,head,knee,elbow,hand,spread,stride:0,roll:radians(.48*settle*Math.sin(age*2.65)+gust*.23)};
 }
 function airPose(actor) {
   const age=Math.max(0,actor.tick-actor.flightStart);
-  const gust=flightGust(age);
+  const gust=.5*flightGust(age)+.3*flightGust(Math.max(0,age-.075))+.2*flightGust(Math.max(0,age-.15));
   const extension=takeoffPose(actor,poses.tuck,actor.tick-(actor.lipTime??actor.flightStart));
   const fold=1-smooth(idealFlightPitch,openFlightPitch,actor.pitch);
   const arms=actor.armFold??fold;
@@ -8142,14 +8213,14 @@ function airPose(actor) {
   const motion=smooth(.035,.29,age)*(1-prepare);
   const wobble=mix(.32,1,smooth(goodFlightPitch,13,Math.abs(actor.pitch-idealFlightPitch)));
   const pose=blendPose(air,{...poses.approach,stride},prepare);
-  return {...pose,roll:pose.roll+radians((actor.windSide||0)*1.13)*motion,angle:mix(skiAngle,slopeAngle,prepare),motion,gust,age,wobble};
+  return {...pose,roll:pose.roll+radians((actor.windSide||0)*.65)*motion,angle:mix(skiAngle,slopeAngle,prepare),motion,gust,age,wobble};
 }
 function jumperPose(actor) {
   if(actor.ceremony) return {hip:[-.105,.96,0],shoulder:[-.087,1.49,0],head:[-.045,1.70,0],
     knee:[-.082,.52,.146],elbow:[.04,1.14,.233],hand:[.16,.96,.34],angle:0,roll:0,spread:0,stride:0};
   if(actor.state==='flight') return airPose(actor);
   if(actor.exitAge!==undefined) {
-    const age=actor.exitAge,phase=actor.gait/1.45,amount=actor.gaitAmount,gate=actor.gateCarry||0;
+    const age=actor.exitAge,phase=actor.gait/walkCycleDistance,amount=actor.gaitAmount,gate=actor.gateCarry||0;
     const stride=Math.sin(phase*Math.PI*2)*amount;
     const sway=Math.cos(phase*Math.PI*2)*amount*(1-gate*.55);
     const crouch=smooth(.08,.61,age)*(1-smooth(1.12,2.04,age));
@@ -8285,12 +8356,13 @@ function skier(actor=s,rig=null) {
     hideEquipment=!!actor.ceremony;
     const offset=side*pose.stride, stance=actor.ceremony?.142:.27+Math.abs(pose.spread)*.40+(pose.stanceGain||0);
     const {motion=0,gust=0,age=0,wobble=1}=pose;
-    const correction=Math.sin(age*7.1+side*.8)*wobble,balance=Math.sin(age*4.45-side*1.09)*wobble;
+    const correction=(.64*Math.sin(age*3.8+side*.8)+.25*Math.sin(age*5.2-side*.46))*wobble;
+    const balance=Math.sin(age*2.95-side*1.09)*wobble;
     const crosswind=actor.windSide||0;
     const exposed=Math.max(0,side*crosswind);
     const yaw=side*pose.spread+radians(motion*(correction*.78+side*gust*.52+crosswind*.28));
-    const pitch=radians(motion*(balance*.88+gust*.61+exposed*.68*Math.sin(age*4.1+side*.8)));
-    const edge=radians(motion*(side*5.6+correction*1.75))+(pose.edge||0)*(pose.balanceSide||side);
+    const pitch=radians(motion*(balance*.62+gust*.38+exposed*.37*Math.sin(age*3.2+side*.8)));
+    const edge=radians(motion*(side*5.6+correction*.93))+(pose.edge||0)*(pose.balanceSide||side);
     const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),ce=Math.cos(edge),se=Math.sin(edge);
     function skiPoint(x,y,z) {
       const length=x-binding[0], up=(y-.045)*ce-z*se;
@@ -8637,6 +8709,8 @@ function render(elapsed,blend=1,visualTime=0) {
   const actor=ceremony?podiumActor(ceremony.medallists[0],0):cpuShow?cpuActor():replay?.actor||(afterJump?exitActor(s,afterJump):s.previous&&blend<1?{
     ...s,x:mix(s.previous.x,s.x,blend),y:mix(s.previous.y,s.y,blend),z:mix(s.previous.z,s.z,blend),
     yaw:mix(s.previous.yaw,s.yaw,blend),tick:mix(s.previous.tick,s.tick,blend),
+    vx:mix(s.previous.vx,s.vx,blend),vy:mix(s.previous.vy,s.vy,blend),
+    wind:mix(s.previous.wind,s.wind,blend),windSide:mix(s.previous.windSide,s.windSide,blend),
     pitch:mix(s.previous.pitch,s.pitch,blend),armFold:mix(s.previous.armFold||0,s.armFold||0,blend)
   }:s);
   const reset=s.camReset||cameraReset||!lastCameraActor;
@@ -8691,9 +8765,10 @@ function render(elapsed,blend=1,visualTime=0) {
   });
   else if(!cpuShow) drawSkiTraces(afterJump&&!replay?s:actor,model);
   visibleLeadFaces.length=0;
+  if(afterJump&&!replay&&!ceremony&&!cpuShow) updateFootprints(actor,afterJump);
   if(!ceremony) drawLeadLine(actor,visibleLeadFaces);
   const overlays=[recordFaces,visibleLeadFaces,eye[0]>initialX-1.81&&actor.x<initialX+26?startBackdrop:emptyOverlay,
-    !replay||actor.state==='result'?eventScreenFaces:emptyOverlay];
+    !replay||actor.state==='result'?eventScreenFaces:emptyOverlay,!replay?afterJump?.footprints||emptyOverlay:emptyOverlay];
   if(!rig) for(const faces of overlays) model.push(...faces);
   if(!rig) snowSpray(actor,model);
   if(gpu) {
